@@ -2,35 +2,55 @@
 #include <functional>
 #include <system_error>
 
+#include <thread>
+#include <chrono>
+#include <deque>
+
+#include <string>
+#include <set>
+
+using namespace std::literals::chrono_literals;
+
+template<auto& t>
+using tag_of = std::decay_t<decltype(t)>;
+
 constexpr inline struct set_value_fn {
     template<class Receiver, class... An>
-    void operator()(Receiver& r, An&&... an) const {r.set_value((An&&)an...);}
+    void operator()(Receiver&& r, An&&... an) const {r.set_value((An&&)an...);}
 } set_value{};
 constexpr inline struct set_error_fn {
     template<class Receiver, class E>
-    void operator()(Receiver& r, E&& e) const noexcept {r.set_error((E&&)e);}
+    void operator()(Receiver&& r, E&& e) const noexcept {r.set_error((E&&)e);}
 } set_error{};
 constexpr inline struct set_done_fn {
     template<class Receiver>
-    void operator()(Receiver& r) const noexcept {r.set_done();}
+    void operator()(Receiver&& r) const noexcept {r.set_done();}
 } set_done{};
 
 constexpr inline struct schedule_fn {
     template<class Scheduler>
-    auto operator()(Scheduler& s) const {return s.schedule();}
+    auto operator()(Scheduler s) const {return s.schedule();}
 } schedule{};
 constexpr inline struct now_fn {
     template<class Scheduler>
-    auto operator()(Scheduler& s) const {return s.now();}
+    auto operator()(Scheduler s) const {return s.now();}
 } now{};
 constexpr inline struct schedule_at_fn {
     template<class Scheduler, class TimePoint>
-    auto operator()(Scheduler& s, TimePoint when) const {return s.schedule_at(when);}
+    auto operator()(Scheduler s, TimePoint when) const {return s.schedule_at(when);}
 } schedule_at{};
-
-#include <thread>
-#include <chrono>
-#include <deque>
+constexpr inline struct connect_fn {
+    template<class Sender, class Receiver>
+    auto operator()(Sender s, Receiver&& r) const {
+      return s.connect((Receiver&&)r);
+    }
+} connect{};
+constexpr inline struct start_fn {
+    template<class Operation>
+    void operator()(Operation& o) const {
+      o.start();
+    }
+} start{};
 
 struct empty_receiver {
   template<class... An>
@@ -192,31 +212,6 @@ constexpr inline struct current_thread_scheduler_impl {
   }
 } current_thread_scheduler{};
 
-constexpr inline struct connect_fn {
-    template<class Sender, class Receiver>
-    auto operator()(Sender& s, Receiver&& r) const {
-      return s.connect((Receiver&&)r);
-    }
-} connect{};
-template<class Operation>
-struct start_scheduler_receiver {
-  Operation op_;
-  void set_value() noexcept { op_.start(); }
-  template<class E>
-  void set_error(E) noexcept { std::terminate(); }
-  void set_done() noexcept {  }
-};
-constexpr inline struct start_fn {
-    template<class Operation>
-    void operator()(Operation& o) const {
-      auto s = schedule(current_thread_scheduler);
-      auto op = connect(
-        s,
-        start_scheduler_receiver<Operation>{std::move(o)});
-      op.start();
-    }
-} start{};
-
 struct wait_until_receiver {
   std::atomic<bool>* signaled_;
   template<class... An>
@@ -227,7 +222,7 @@ struct wait_until_receiver {
 };
 constexpr inline struct wait_until_fn {
     template<class Sender, class Booster>
-    void operator()(Sender& s, Booster& b ) const {
+    void operator()(Sender s, Booster& b ) const {
       std::atomic<bool> signaled{false};
       auto op = connect(s, wait_until_receiver{&signaled});
       start(op);
@@ -326,7 +321,12 @@ struct transformreceiver {
   Receiver r_;
   template<class... An>
   void set_value(An&&... an){
-    ::set_value(r_, fn_((An&&)an...));
+    if constexpr (std::is_void_v<std::invoke_result_t<Fn, An...>>) {
+      fn_((An&&)an...);
+      ::set_value(r_);
+    } else {
+      ::set_value(r_, fn_((An&&)an...));
+    }
   }
   template<class E>
   void set_error(E e) noexcept {
@@ -424,6 +424,90 @@ constexpr inline struct tap_fn {
   }
 } tap;
 
+template<class Receiver>
+struct take_untilreceiver {
+  Receiver r_;
+  bool stopped_ = false;
+  template<class... An>
+  void set_value(An&&... an){
+    if (std::exchange(stopped_, true)) { return; }
+    ::set_value(r_, (An&&)an...);
+  }
+  template<class E>
+  void set_error(E e) noexcept {
+    if (std::exchange(stopped_, true)) { return; }
+    ::set_error(r_, e);
+  }
+  void set_done() noexcept {
+    if (std::exchange(stopped_, true)) { return; }
+    ::set_done(r_);
+  }
+};
+template<class Receiver>
+struct take_untiltrigger {
+  Receiver r_;
+  template<class... An>
+  void set_value(An&&...){
+    ::set_done(r_);
+  }
+  template<class E>
+  void set_error(E) noexcept {
+    ::set_done(r_);
+  }
+  void set_done() noexcept {
+    ::set_done(r_);
+  }
+};
+template<class Receiver>
+struct receiver_ref {
+  Receiver* r_;
+  template<class... An>
+  void set_value(An&&... an){
+    ::set_value(*r_, (An&&)an...);
+  }
+  template<class E>
+  void set_error(E e) noexcept {
+    ::set_error(*r_, e);
+  }
+  void set_done() noexcept {
+    ::set_done(*r_);
+  }
+};
+template<class Sender, class Trigger, class Receiver>
+struct take_untiloperation {
+  using receiver_t = take_untilreceiver<Receiver>;
+  using op_t = std::invoke_result_t<tag_of<::connect>, Sender&, receiver_ref<receiver_t>>;
+  using trigger_t = std::invoke_result_t<tag_of<::connect>, Trigger&, take_untiltrigger<receiver_ref<receiver_t>>>;
+  receiver_t r_;
+  op_t op_;
+  trigger_t t_;
+  explicit take_untiloperation(Sender& s, Trigger& t, Receiver r) : 
+    r_(take_untilreceiver<Receiver>{r}), 
+    op_(::connect(s, receiver_ref<receiver_t>{&r_})),
+    t_(::connect(t, take_untiltrigger<receiver_ref<receiver_t>>{{&r_}})) {}
+  
+  take_untiloperation(const take_untiloperation&) = delete;
+  take_untiloperation(take_untiloperation&&) = delete;
+  void start(){
+    ::start(op_);
+    ::start(t_);
+  }
+};
+template<class Sender, class Trigger>
+struct take_untilsender {
+  Sender s_;
+  Trigger t_;
+  template<class Receiver>
+  auto connect(Receiver r) { 
+    return take_untiloperation<Sender, Trigger, Receiver>{s_, t_, r};
+  }
+};
+constexpr inline struct take_until_fn {
+  template<class Sender, class Trigger>
+  auto operator()(Sender s, Trigger t) const {
+    return take_untilsender<Sender, Trigger>{s, t};
+  }
+} take_until;
 
 template<class Operation>
 struct on_scheduler_receiver {
@@ -451,3 +535,132 @@ constexpr inline struct on_fn {
     return onsender<Sender, Scheduler>{s, on};
   }
 } on;
+
+template<class Sender, class Receiver>
+struct enforce_receiver;
+
+template<class Sender, class Receiver>
+struct enforcer {
+  using op_t = std::invoke_result_t<tag_of<::connect>, Sender&, enforce_receiver<Sender, Receiver>>;
+
+  op_t* current_operation_ = nullptr;
+  op_t* started_operation_ = nullptr;
+  std::set<op_t*> expired_operations_;
+  std::set<Receiver*> expired_receivers_;
+  std::set<Receiver*> completed_receivers_;
+
+  void check_receiver(Receiver* r, const char* message) {
+    auto completed_receiver = completed_receivers_.count(r) > 0;
+    if (started_operation_ != nullptr && completed_receiver) {
+        auto valid_receiver = expired_receivers_.count(r) == 0;
+        if (valid_receiver && completed_receiver) {return;}
+        printf("%s:\n\tfn - %s\n\t%s\n", typeid(*r).name(), message, 
+          valid_receiver ? "valid receiver" : "invalid receiver");
+    }
+  }
+  void check_running_receiver(Receiver* r, const char* message) {
+    auto valid_receiver = expired_receivers_.count(r) == 0;
+    auto completed_receiver = completed_receivers_.count(r) > 0;
+    if (nullptr == started_operation_) {
+      printf("%s:\n\t%s\n\t%s\n", typeid(*r).name(), message, "no operation was started");
+    } else if (current_operation_ != started_operation_ || !valid_receiver || completed_receiver) {
+      printf("%s:\n\t%s\n\t%s\n\t%s\n\t%s\n", typeid(*r).name(), message, 
+        current_operation_ == started_operation_ ? "valid operation" : "invalid operation",
+        valid_receiver ? "valid receiver" : "invalid receiver",
+        completed_receiver ? "already completed" : "completing");
+    }
+  }
+
+  void receiver(Receiver* r) {
+    check_receiver(r, "~receiver");
+    expired_receivers_.insert(r);
+  }
+  template<class... An>
+  void set_value(Receiver* r, An&&... an) {
+    check_running_receiver(r, __FUNCTION__);
+    completed_receivers_.insert(r);
+    ::set_value(*r, (An&&)an...);
+  }
+  template<class E>
+  void set_error(Receiver* r, E e) noexcept {
+    check_running_receiver(r, __FUNCTION__);
+    completed_receivers_.insert(r);
+    ::set_error(*r, e);
+  }
+  void set_done(Receiver* r) noexcept {
+    check_running_receiver(r, __FUNCTION__);
+    completed_receivers_.insert(r);
+    ::set_done(*r);
+  }
+
+  void check_operation(op_t* op, const char* message) {
+   if (started_operation_ != op) { return; }
+    if (expired_operations_.count(op) > 0 ||
+        completed_receivers_.size() != 1) 
+        {
+      printf("%s:\n\tfn - %s\n\t%s\n\t%s\n\t%s\n", typeid(*op).name(), message, 
+        expired_operations_.count(op) > 0 ? "expired" : "valid",
+        completed_receivers_.size() > 0 ? "completed" : "not completed",
+        !!current_operation_ ? "running" : "not running");
+    }
+  }
+
+  void operation(op_t* op) {
+    check_operation(op, "~operation");
+    current_operation_ = nullptr;
+    expired_operations_.insert(op);
+  }
+  void start(op_t* op) {
+    if (nullptr != started_operation_) {
+      printf("%s:\n\tfn - %s\n\t%s\n", typeid(*op).name(), __FUNCTION__, "operation is already started");
+    }
+    current_operation_ = op;
+    started_operation_ = op;
+    ::start(*op);
+  }
+};
+template<class Sender, class Receiver>
+struct enforce_receiver {
+  Receiver r_;
+  std::shared_ptr<enforcer<Sender, Receiver>> enforcer_;
+  ~enforce_receiver() {
+    enforcer_->receiver(&r_);
+  }
+  template<class... An>
+  void set_value(An&&... an) {
+    enforcer_->set_value(&r_, (An&&)an...);
+  }
+  template<class E>
+  void set_error(E e) noexcept {
+    enforcer_->set_error(&r_, e);
+  }
+  void set_done() noexcept {
+    enforcer_->set_done(&r_);
+  }
+};
+template<class Sender, class Receiver>
+struct enforce_operation {
+  using op_t = std::invoke_result_t<tag_of<::connect>, Sender&, enforce_receiver<Sender, Receiver>>;
+  op_t op_;
+  std::shared_ptr<enforcer<Sender, Receiver>> enforcer_;
+  ~enforce_operation() {
+    enforcer_->operation(&op_);
+  }
+  void start() {
+    enforcer_->start(&op_);
+  }
+};
+template<class Sender>
+struct enforce_sender {
+  Sender s_;
+  template<class Receiver>
+  auto connect(Receiver r) {
+    auto e = std::make_shared<enforcer<Sender, Receiver>>();
+    return enforce_operation<Sender, Receiver>{
+      ::connect(s_, enforce_receiver<Sender, Receiver>{r, e}), 
+      e
+    };
+  }
+};
+template<class Sender>
+enforce_sender(Sender) -> enforce_sender<Sender>;
