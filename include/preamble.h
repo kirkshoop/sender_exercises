@@ -215,10 +215,10 @@ constexpr inline struct current_thread_scheduler_impl {
 struct wait_until_receiver {
   std::atomic<bool>* signaled_;
   template<class... An>
-  void set_value(An&&...){*signaled_ = true;}
+  void set_value(An&&...){signaled_->store(true);}
   template<class E>
-  void set_error(E){*signaled_ = true;}
-  void set_done(){*signaled_ = true;}
+  void set_error(E){signaled_->store(true);}
+  void set_done(){signaled_->store(true);}
 };
 constexpr inline struct wait_until_fn {
     template<class Sender, class Booster>
