@@ -2,6 +2,7 @@
 #include <functional>
 #include <system_error>
 
+#include <atomic>
 #include <thread>
 #include <chrono>
 #include <deque>
